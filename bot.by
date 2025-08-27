@@ -1,57 +1,78 @@
 # -*- coding: utf-8 -*-
 """
-Movies & Series Bot – OMDb + Trakt + Watchmode (Alt to TMDB)
-------------------------------------------------------------
-- python-telegram-bot v21.x
-- Arabic UI (SA)
-- Search & Posters: OMDb (free key)  https://www.omdbapi.com/
-- Calendars (today/week): Trakt       https://trakt.docs.apiary.io/#
-- Where-to-watch (SA): Watchmode      https://api.watchmode.com/
+Telegram Movies & Series Bot (Arabic) – OMDb + Trakt + Watchmode
+-----------------------------------------------------------------
+✔ python-telegram-bot v21.x (async, polling)
+✔ Reads .env via python-dotenv
+✔ Search & posters via OMDb
+✔ Calendars (today/week) via Trakt (Client ID only)
+✔ Where-to-watch (region-aware) via Watchmode (optional)
 
-ENV (required/optional):
-  BOT_TOKEN=123:ABC
-  OMDB_API_KEY=xxxxx                  # required (بديل TMDB)
-  TRAKT_CLIENT_ID=xxxxx               # recommended (للتقاويم today/week)
-  WATCHMODE_API_KEY=xxxxx             # optional (أماكن المشاهدة + /platform)
-  REGION=SA                           # default SA
+Quick start
+===========
+1) Create .env next to this file:
 
-Run:
-  pip install python-telegram-bot~=21.6 httpx
-  python bot.py
+BOT_TOKEN=123:ABC
+OMDB_API_KEY=omdb_xxx
+TRAKT_CLIENT_ID=trakt_xxx
+WATCHMODE_API_KEY=watchmode_xxx   # optional
+REGION=SA                         # default SA
+
+2) Install & run:
+   pip install python-telegram-bot~=21.6 httpx python-dotenv
+   python3 telegram_movies_bot.py
+
+Render (Background Worker)
+==========================
+- Build:    pip install -r requirements.txt
+- Start:    python3 telegram_movies_bot.py
+- Add the same env vars in the dashboard.
+
+Notes
+=====
+- If you don't set WATCHMODE_API_KEY, the bot works but without the
+  "📺 أماكن المشاهدة" button and /platform menu.
+- If you don't set TRAKT_CLIENT_ID, /today and /week will say it's required.
+- Keep messages short; this is a minimal MVP ready to extend.
 """
-import asyncio
-import logging
+
+from __future__ import annotations
 import os
-from functools import lru_cache
+import logging
 from typing import Dict, Any, List, Optional
 
+from dotenv import load_dotenv
 import httpx
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ApplicationBuilder, Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
 
-# ===== Logging =====
+# ---------------------------------------------------------------
+# Env & logging
+# ---------------------------------------------------------------
+load_dotenv()  # read .env if present
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("mvbot")
 
-# ===== ENV =====
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OMDB_API_KEY = os.getenv("OMDB_API_KEY", "").strip()
-TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID", "").strip()
-WATCHMODE_API_KEY = os.getenv("WATCHMODE_API_KEY", "").strip()
-REGION = os.getenv("REGION", "SA").strip().upper() or "SA"
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+OMDB_API_KEY = (os.getenv("OMDB_API_KEY") or "").strip()
+TRAKT_CLIENT_ID = (os.getenv("TRAKT_CLIENT_ID") or "").strip()
+WATCHMODE_API_KEY = (os.getenv("WATCHMODE_API_KEY") or "").strip()
+REGION = (os.getenv("REGION") or "SA").strip().upper() or "SA"
 
-if not BOT_TOKEN or not OMDB_API_KEY:
-    raise RuntimeError("BOT_TOKEN و OMDB_API_KEY مطلوبة")
+if not BOT_TOKEN:
+    raise SystemExit("[FATAL] BOT_TOKEN is missing. Put it in .env or environment.")
+if not OMDB_API_KEY:
+    raise SystemExit("[FATAL] OMDB_API_KEY is missing. Get it from omdbapi.com and set it.")
 
 OMDB = "https://www.omdbapi.com/"
 
-# ===== HTTP =====
+# single shared HTTP client
 _client: Optional[httpx.AsyncClient] = None
 
 def client() -> httpx.AsyncClient:
@@ -60,24 +81,29 @@ def client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(timeout=20)
     return _client
 
-# ===== Helpers: OMDb =====
-@lru_cache(maxsize=512)
+# ---------------------------------------------------------------
+# OMDb helpers
+# ---------------------------------------------------------------
 async def omdb_search(q: str) -> List[Dict[str, Any]]:
+    """Search movies/series by text; returns short list."""
     params = {"apikey": OMDB_API_KEY, "s": q, "type": "", "r": "json"}
     r = await client().get(OMDB, params=params)
     r.raise_for_status()
     js = r.json() or {}
     return js.get("Search") or []
 
-@lru_cache(maxsize=512)
 async def omdb_by_id(imdb_id: str) -> Dict[str, Any]:
+    """Fetch details/poster/plot by IMDb ID."""
     params = {"apikey": OMDB_API_KEY, "i": imdb_id, "plot": "short", "r": "json"}
     r = await client().get(OMDB, params=params)
     r.raise_for_status()
     return r.json() or {}
 
-# ===== Helpers: Trakt (Calendars) =====
+# ---------------------------------------------------------------
+# Trakt helpers (calendars)
+# ---------------------------------------------------------------
 async def trakt_calendar(start: str, days: int, kind: str = "shows") -> List[Dict[str, Any]]:
+    """kind in {"shows","movies"}. Requires TRAKT_CLIENT_ID only."""
     if not TRAKT_CLIENT_ID:
         return []
     headers = {
@@ -90,7 +116,9 @@ async def trakt_calendar(start: str, days: int, kind: str = "shows") -> List[Dic
     r.raise_for_status()
     return r.json()
 
-# ===== Helpers: Watchmode =====
+# ---------------------------------------------------------------
+# Watchmode helpers (optional)
+# ---------------------------------------------------------------
 async def watchmode_search_by_imdb(imdb_id: str) -> Optional[int]:
     if not WATCHMODE_API_KEY:
         return None
@@ -106,13 +134,17 @@ async def watchmode_sources_by_imdb(imdb_id: str) -> List[Dict[str, Any]]:
     wm_id = await watchmode_search_by_imdb(imdb_id)
     if not wm_id:
         return []
-    s_params = {"apiKey": WATCHMODE_API_KEY, "regions": REGION}
-    r2 = await client().get(f"https://api.watchmode.com/v1/title/{wm_id}/sources/", params=s_params)
-    r2.raise_for_status()
+    params = {"apiKey": WATCHMODE_API_KEY, "regions": REGION}
+    r = await client().get(f"https://api.watchmode.com/v1/title/{wm_id}/sources/", params=params)
+    r.raise_for_status()
     keep = []
-    for s in r2.json():
+    for s in r.json():
         if s.get("region") == REGION and s.get("type") in {"sub", "free", "rent", "buy"}:
-            keep.append({"name": s.get("name"), "type": s.get("type"), "web_url": s.get("web_url")})
+            keep.append({
+                "name": s.get("name"),
+                "type": s.get("type"),  # sub/free/rent/buy
+                "web_url": s.get("web_url"),
+            })
     return keep[:12]
 
 async def watchmode_sources_list() -> List[Dict[str, Any]]:
@@ -145,7 +177,9 @@ async def watchmode_titles_by_source_name(source_name: str, limit: int = 10) -> 
     r.raise_for_status()
     return r.json().get("titles") or []
 
-# ===== UI =====
+# ---------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------
 PLATFORMS = ["Netflix", "Prime Video", "Disney+", "Apple TV+", "OSN+", "Shahid"]
 
 def menu_kb() -> InlineKeyboardMarkup:
@@ -160,7 +194,9 @@ def platforms_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅︎ رجوع", callback_data="MENU:home")])
     return InlineKeyboardMarkup(rows)
 
-# ===== Formatting =====
+# ---------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------
 def fmt_item_omdb(full: Dict[str, Any]) -> str:
     title = full.get("Title") or "—"
     year = full.get("Year") or "—"
@@ -170,26 +206,43 @@ def fmt_item_omdb(full: Dict[str, Any]) -> str:
         plot = plot[:240] + "…"
     return f"*{title}* ({year})\nالنوع: `{typ}`\n{plot}"
 
-# ===== Handlers =====
+# ---------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
         "👋 أهلاً! بوت متابعة جديد الأفلام والمسلسلات.\n\n"
-        "• /today — جديد اليوم\n• /week — هذا الأسبوع\n• /search اسم — بحث سريع بالعربي/الإنجليزي\n• /platform — حسب المنصّة (لو فعلنا Watchmode)\n",
+        "• /today — جديد اليوم\n• /week — هذا الأسبوع\n• /search اسم — بحث سريع\n• /platform — حسب المنصّة (لو فعلنا Watchmode)\n",
         reply_markup=menu_kb(),
     )
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("pong ✅")
+
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = " ".join(context.args) if context.args else (update.message.text.split(maxsplit=1)[-1] if update.message.text.startswith("/search") else update.message.text)
+    q = " ".join(context.args) if context.args else (
+        update.message.text.split(maxsplit=1)[-1] if update.message and update.message.text.startswith("/search") else (update.message.text if update.message else "")
+    )
     if not q:
         await update.effective_chat.send_message("اكتب: /search اسم الفيلم أو المسلسل")
         return
-    rows = await omdb_search(q)
+    try:
+        rows = await omdb_search(q)
+    except Exception as e:
+        log.exception("omdb_search failed")
+        await update.effective_chat.send_message("تعذر الاتصال بمصدر البحث حالياً.")
+        return
+
     if not rows:
         await update.effective_chat.send_message("لم نجد نتائج.")
         return
+
     for it in rows[:6]:
         imdb_id = it.get("imdbID")
-        full = await omdb_by_id(imdb_id)
+        try:
+            full = await omdb_by_id(imdb_id)
+        except Exception:
+            continue
         poster = full.get("Poster") if full.get("Poster") and full.get("Poster") != "N/A" else None
         caption = fmt_item_omdb(full)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📺 أماكن المشاهدة", callback_data=f"SRC_IMDB:{imdb_id}")]]) if WATCHMODE_API_KEY else None
@@ -201,7 +254,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    action = q.data.split(":",1)[1]
+    action = q.data.split(":", 1)[1]
     if action == "today":
         await show_today(q)
     elif action == "week":
@@ -214,7 +267,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_today(q):
     shows = await trakt_calendar("today", 1, kind="shows") if TRAKT_CLIENT_ID else []
     movies = await trakt_calendar("today", 1, kind="movies") if TRAKT_CLIENT_ID else []
-    lines = []
+    lines: List[str] = []
     for s in shows[:8]:
         try:
             lines.append(f"📺 {s['first_aired'][:10]} — {s['show']['title']} S{s['episode']['season']}E{s['episode']['number']}")
@@ -226,14 +279,14 @@ async def show_today(q):
         except Exception:
             pass
     if not lines:
-        await q.edit_message_text("*اليوم*\n(لزم TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+        await q.edit_message_text("*اليوم*\n(يتطلب TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
         return
     await q.edit_message_text("*اليوم*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
 async def show_week(q):
     shows = await trakt_calendar("today", 7, kind="shows") if TRAKT_CLIENT_ID else []
     movies = await trakt_calendar("today", 7, kind="movies") if TRAKT_CLIENT_ID else []
-    lines = []
+    lines: List[str] = []
     for s in shows[:10]:
         try:
             lines.append(f"📺 {s['first_aired'][:10]} — {s['show']['title']} S{s['episode']['season']}E{s['episode']['number']}")
@@ -245,14 +298,14 @@ async def show_week(q):
         except Exception:
             pass
     if not lines:
-        await q.edit_message_text("*هذا الأسبوع*\n(لزم TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+        await q.edit_message_text("*هذا الأسبوع*\n(يتطلب TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
         return
     await q.edit_message_text("*هذا الأسبوع*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
 async def on_sources_imdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    imdb_id = q.data.split(":",1)[1]
+    imdb_id = q.data.split(":", 1)[1]
     if not WATCHMODE_API_KEY:
         await q.edit_message_text("ميزة أماكن المشاهدة غير مفعّلة حالياً.")
         return
@@ -262,22 +315,24 @@ async def on_sources_imdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     m = []
     for s in src:
-        typ = {"sub":"اشتراك","free":"مجاني","rent":"إيجار","buy":"شراء"}.get(s["type"], s["type"])
+        typ = {"sub": "اشتراك", "free": "مجاني", "rent": "إيجار", "buy": "شراء"}.get(s["type"], s["type"])
         m.append(f"• {s['name']} — {typ}\n{s['web_url']}")
-    await q.edit_message_text("*أماكن المشاهدة ("+REGION+")*\n" + "\n".join(m), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+    await q.edit_message_text("*أماكن المشاهدة (" + REGION + ")*\n" + "\n".join(m), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     class Q:
         def __init__(self, msg): self.message = msg
         async def answer(self): pass
-        async def edit_message_text(self, *a, **kw): await update.effective_chat.send_message(*a, **kw)
+        async def edit_message_text(self, *a, **kw):
+            await update.effective_chat.send_message(*a, **kw)
     await show_today(Q(update.message))
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     class Q:
         def __init__(self, msg): self.message = msg
         async def answer(self): pass
-        async def edit_message_text(self, *a, **kw): await update.effective_chat.send_message(*a, **kw)
+        async def edit_message_text(self, *a, **kw):
+            await update.effective_chat.send_message(*a, **kw)
     await show_week(Q(update.message))
 
 async def cmd_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +344,7 @@ async def cmd_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    _, name = q.data.split(":",1)
+    _, name = q.data.split(":", 1)
     if not WATCHMODE_API_KEY:
         await q.edit_message_text("لم يتم تفعيل Watchmode بعد.")
         return
@@ -305,6 +360,13 @@ async def on_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {nm} ({yr}) — {ty}")
     await q.edit_message_text(f"*الأبرز على {name}*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
+# Error handler for visibility in logs
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error: %s", context.error)
+
+# ---------------------------------------------------------------
+# App builder
+# ---------------------------------------------------------------
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "ابدأ"),
@@ -312,12 +374,15 @@ async def post_init(app: Application):
         BotCommand("today", "جديد اليوم"),
         BotCommand("week", "هذا الأسبوع"),
         BotCommand("platform", "حسب المنصة"),
+        BotCommand("ping", "اختبار"),
     ])
 
-# ===== Main =====
 def build_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(on_error)
+
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
@@ -327,12 +392,10 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_sources_imdb, pattern=r"^SRC_IMDB:"))
     app.add_handler(CallbackQueryHandler(on_platform, pattern=r"^PLAT:"))
 
-    # أي نص ليس أمرًا = اعتبره بحثًا سريعًا
+    # any plain text (not a command) → treat as quick search
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_search))
-
     return app
 
 if __name__ == "__main__":
-    app = build_app()
     log.info("[bot] starting… REGION=%s", REGION)
-    app.run_polling(drop_pending_updates=True)
+    build_app().run_polling(drop_pending_updates=True)
