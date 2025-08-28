@@ -42,6 +42,7 @@ import logging
 from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 import httpx
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
@@ -71,6 +72,10 @@ if not OMDB_API_KEY:
     raise SystemExit("[FATAL] OMDB_API_KEY is missing. Get it from omdbapi.com and set it.")
 
 OMDB = "https://www.omdbapi.com/"
+
+# Helper: today's date in UTC for Trakt
+def _today_iso() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 # single shared HTTP client
 _client: Optional[httpx.AsyncClient] = None
@@ -155,6 +160,9 @@ async def watchmode_sources_list() -> List[Dict[str, Any]]:
     return r.json() or []
 
 async def watchmode_titles_by_source_name(source_name: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Return popular titles on a given platform name in selected REGION.
+    Tries both 'source_ids/regions' and 'source_id/region' flavors to avoid 400s.
+    """
     if not WATCHMODE_API_KEY:
         return []
     sources = await watchmode_sources_list()
@@ -165,6 +173,7 @@ async def watchmode_titles_by_source_name(source_name: str, limit: int = 10) -> 
             break
     if not sid:
         return []
+    # Try plural params first
     params = {
         "apiKey": WATCHMODE_API_KEY,
         "source_ids": sid,
@@ -173,9 +182,25 @@ async def watchmode_titles_by_source_name(source_name: str, limit: int = 10) -> 
         "sort_by": "popularity_desc",
         "limit": limit,
     }
-    r = await client().get("https://api.watchmode.com/v1/list-titles/", params=params)
-    r.raise_for_status()
-    return r.json().get("titles") or []
+    try:
+        r = await client().get("https://api.watchmode.com/v1/list-titles/", params=params)
+        r.raise_for_status()
+        return r.json().get("titles") or []
+    except httpx.HTTPStatusError:
+        try:
+            params = {
+                "apiKey": WATCHMODE_API_KEY,
+                "source_id": sid,
+                "region": REGION,
+                "types": "movie,tv_series",
+                "sort_by": "popularity_desc",
+                "limit": limit,
+            }
+            r2 = await client().get("https://api.watchmode.com/v1/list-titles/", params=params)
+            r2.raise_for_status()
+            return r2.json().get("titles") or []
+        except Exception:
+            return []
 
 # ---------------------------------------------------------------
 # UI helpers
@@ -265,9 +290,13 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("القائمة الرئيسية:", reply_markup=menu_kb())
 
 async def show_today(q):
-    shows = await trakt_calendar("today", 1, kind="shows") if TRAKT_CLIENT_ID else []
-    movies = await trakt_calendar("today", 1, kind="movies") if TRAKT_CLIENT_ID else []
+    start = _today_iso()
     lines: List[str] = []
+    try:
+        shows = await trakt_calendar(start, 1, kind="shows") if TRAKT_CLIENT_ID else []
+        movies = await trakt_calendar(start, 1, kind="movies") if TRAKT_CLIENT_ID else []
+    except Exception:
+        shows, movies = [], []
     for s in shows[:8]:
         try:
             lines.append(f"📺 {s['first_aired'][:10]} — {s['show']['title']} S{s['episode']['season']}E{s['episode']['number']}")
@@ -279,14 +308,21 @@ async def show_today(q):
         except Exception:
             pass
     if not lines:
-        await q.edit_message_text("*اليوم*\n(يتطلب TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+        await q.edit_message_text("*اليوم*
+تعذر جلب تقاويم Trakt حاليًا. جرّب لاحقًا.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
         return
-    await q.edit_message_text("*اليوم*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+    await q.edit_message_text("*اليوم*
+" + "
+".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
 async def show_week(q):
-    shows = await trakt_calendar("today", 7, kind="shows") if TRAKT_CLIENT_ID else []
-    movies = await trakt_calendar("today", 7, kind="movies") if TRAKT_CLIENT_ID else []
+    start = _today_iso()
     lines: List[str] = []
+    try:
+        shows = await trakt_calendar(start, 7, kind="shows") if TRAKT_CLIENT_ID else []
+        movies = await trakt_calendar(start, 7, kind="movies") if TRAKT_CLIENT_ID else []
+    except Exception:
+        shows, movies = [], []
     for s in shows[:10]:
         try:
             lines.append(f"📺 {s['first_aired'][:10]} — {s['show']['title']} S{s['episode']['season']}E{s['episode']['number']}")
@@ -298,11 +334,14 @@ async def show_week(q):
         except Exception:
             pass
     if not lines:
-        await q.edit_message_text("*هذا الأسبوع*\n(يتطلب TRAKT_CLIENT_ID لعرض التقاويم)", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+        await q.edit_message_text("*هذا الأسبوع*
+تعذر جلب تقاويم Trakt حاليًا. جرّب لاحقًا.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
         return
-    await q.edit_message_text("*هذا الأسبوع*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+    await q.edit_message_text("*هذا الأسبوع*
+" + "
+".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
-async def on_sources_imdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_sources_imdb(update: Update, context: ContextTypes.DEFAULT_TYPE):(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     imdb_id = q.data.split(":", 1)[1]
@@ -348,9 +387,12 @@ async def on_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WATCHMODE_API_KEY:
         await q.edit_message_text("لم يتم تفعيل Watchmode بعد.")
         return
-    titles = await watchmode_titles_by_source_name(name, limit=12)
+    try:
+        titles = await watchmode_titles_by_source_name(name, limit=12)
+    except Exception:
+        titles = []
     if not titles:
-        await q.edit_message_text("لا توجد نتائج حالياً لهذه المنصة في منطقتك.")
+        await q.edit_message_text("لا توجد نتائج حالياً لهذه المنصة في منطقتك أو تعذّر الوصول للمزود.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
         return
     lines = []
     for t in titles:
@@ -358,7 +400,9 @@ async def on_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ty = t.get("type") or "—"
         yr = t.get("year") or "—"
         lines.append(f"• {nm} ({yr}) — {ty}")
-    await q.edit_message_text(f"*الأبرز على {name}*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
+    await q.edit_message_text(f"*الأبرز على {name}*
+" + "
+".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu_kb())
 
 # Error handler for visibility in logs
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
