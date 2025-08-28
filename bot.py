@@ -1,287 +1,202 @@
 # -*- coding: utf-8 -*-
 """
-بوت تيليجرام احترافي وخفيف لعرض قوائم أفلام/مسلسلات مع فحص صحة الخدمات.
-- يعتمد أساسًا على Trakt (قوائم رائجة/أكثر مشاهدة أسبوعيًا)
-- يدعم فحص الحالة للأمزِدَة (Trakt/OMDb/Watchmode)
-- معاملات آمنة، إعادة محاولات تلقائية، وتحرير رسائل بدون أخطاء "Message is not modified"
+بوت تيليجرام لتنزيل *قانوني* من الروابط المباشرة والمصادر المرخّصة فقط.
+- يمنع المنصّات المحمية (YouTube/TikTok/Instagram/Snap/…)
+- ينزّل أي ملف وسائط من رابط مباشر مسموح (video/* أو audio/*)
+- يرسل الملف للمستخدم كـ Document بأعلى جودة متاحة كما هو (لا نضيف علامة مائية)
+- يفحص الحجم المعلن (Content-Length) ويتوقف بأدب لو أكبر من الحد الآمن
 
 الأوامر:
-  /start     → القائمة الرئيسية
-  /movies    → أفلام رائجة الآن
-  /shows     → مسلسلات رائجة الآن
-  /topweek   → الأكثر مشاهدة هذا الأسبوع (أفلام + مسلسلات)
-  /status    → فحص صحة المفاتيح والخدمات
-  /ping      → اختبار سريع
+  /start      → شرح سريع
+  /download <URL>  → تنزيل من رابط مباشر مسموح
+  /status     → فحص بسيط لحالة البوت
 
 بيئة التشغيل (Render → Environment):
   BOT_TOKEN=توكن_تيليجرام (مطلوب)
-  TRAKT_CLIENT_ID=معرّف تطبيق Trakt (مطلوب)
-  OMDB_API_KEY=مفتاح OMDb (اختياري للفحص)
-  WATCHMODE_API_KEY=مفتاح Watchmode (اختياري للفحص)
+  MAX_BYTES=1900000000         (اختياري: الحد الأقصى ~1.9GB)
 
 Render (Background Worker):
   Build: pip install -r requirements.txt
-  Start: python3 bot_pro.py
+  Start: python3 bot_legal_downloader.py
 
-محليًا:
-  pip install python-telegram-bot==21.6 httpx==0.27.0 python-dotenv==1.0.1
-  BOT_TOKEN=... TRAKT_CLIENT_ID=... python3 bot_pro.py
+requirements.txt المقترح:
+  python-telegram-bot==21.6
+  httpx==0.27.0
 """
 from __future__ import annotations
-import os, logging, asyncio, time
-from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+import os, re, tempfile, mimetypes, logging, asyncio, pathlib
+from urllib.parse import urlparse
+from typing import Optional
 
 import httpx
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ===================== الإعداد العام =====================
+# ===== إعداد =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("probot")
+log = logging.getLogger("legaldl")
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-TRAKT_CLIENT_ID = (os.getenv("TRAKT_CLIENT_ID") or "").strip()
-OMDB_API_KEY = (os.getenv("OMDB_API_KEY") or "").strip()
-WATCHMODE_API_KEY = (os.getenv("WATCHMODE_API_KEY") or "").strip()
-REGION = (os.getenv("REGION") or "SA").strip().upper()
-
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN مفقود")
-if not TRAKT_CLIENT_ID:
-    raise SystemExit("TRAKT_CLIENT_ID مفقود")
 
-# HTTP client مع حدود واتصالات دائمة
+MAX_BYTES = int(os.getenv("MAX_BYTES", "1900000000"))  # ~1.9GB افتراضيًا
+
+# قوائم منع واضحة للمنصّات المحمية (سلاسل جزئية في الـ hostname)
+DENY_HOST_SUBSTR = [
+    "tiktok", "ttw", "byte",  # TikTok/CDNs
+    "youtube", "youtu.be", "googlevideo", "ytimg",  # YouTube
+    "instagram", "cdninstagram", "fbcdn", "facebook",  # IG/FB
+    "snap", "sc-cdn",  # Snapchat
+    "x.com", "twitter", "twimg",  # X/Twitter
+    "spotify", "apple.com", "netflix", "disney", "primevideo", "hulu", "osn", "shahid",
+]
+
+ALLOWED_SCHEMES = {"http", "https"}
+
+# ===== HTTP عميل =====
 _http: Optional[httpx.AsyncClient] = None
 
 def http() -> httpx.AsyncClient:
     global _http
     if _http is None:
-        _http = httpx.AsyncClient(
-            timeout=20,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-        )
+        _http = httpx.AsyncClient(timeout=60)
     return _http
 
-# إعادة محاولات تلقائية بسيطة
-RETRY_STATUSES = {429, 500, 502, 503, 504}
-async def get_json(url: str, *, headers: Dict[str, str] | None = None, params: Dict[str, Any] | None = None, retries: int = 3) -> Any:
-    for attempt in range(retries):
-        try:
-            r = await http().get(url, headers=headers, params=params)
-            if r.status_code in RETRY_STATUSES and attempt + 1 < retries:
-                await asyncio.sleep(0.6 * (2 ** attempt))
-                continue
-            r.raise_for_status()
-            return r.json()
-        except httpx.HTTPStatusError as e:
-            if e.response is not None and e.response.status_code in RETRY_STATUSES and attempt + 1 < retries:
-                await asyncio.sleep(0.6 * (2 ** attempt))
-                continue
-            raise
+# ===== أدوات =====
 
-# ===================== Trakt API =====================
-TRAKT_HEADERS = {
-    "trakt-api-version": "2",
-    "trakt-api-key": TRAKT_CLIENT_ID,
-}
-
-async def trakt(path: str, params: Dict[str, Any] | None = None) -> Any:
-    return await get_json(f"https://api.trakt.tv{path}", headers=TRAKT_HEADERS, params=params or {})
-
-async def trending_movies(limit: int = 10):
-    return await trakt("/movies/trending", {"limit": limit})
-
-async def trending_shows(limit: int = 10):
-    return await trakt("/shows/trending", {"limit": limit})
-
-async def watched_weekly_movies(limit: int = 10):
-    return await trakt("/movies/watched/weekly", {"limit": limit})
-
-async def watched_weekly_shows(limit: int = 10):
-    return await trakt("/shows/watched/weekly", {"limit": limit})
-
-# ===================== Watchmode (اختياري للفحص) =====================
-async def watchmode_sources() -> Any:
-    if not WATCHMODE_API_KEY:
-        return None
-    return await get_json("https://api.watchmode.com/v1/sources/", params={"apiKey": WATCHMODE_API_KEY})
-
-# ===================== أدوات تنسيق + واجهة =====================
-
-def _fmt_movie(m: Dict[str, Any], i: int) -> str:
-    mv = m.get("movie", {}) if "movie" in m else m
-    t = mv.get("title") or "—"
-    y = mv.get("year") or "—"
-    imdb = (mv.get("ids") or {}).get("imdb")
-    link = f"\nhttps://www.imdb.com/title/{imdb}/" if imdb else ""
-    return f"{i}. 🎬 *{t}* ({y}){link}"
-
-
-def _fmt_show(s: Dict[str, Any], i: int) -> str:
-    sh = s.get("show", {}) if "show" in s else s
-    t = sh.get("title") or "—"
-    y = sh.get("year") or "—"
-    imdb = (sh.get("ids") or {}).get("imdb")
-    link = f"\nhttps://www.imdb.com/title/{imdb}/" if imdb else ""
-    return f"{i}. 📺 *{t}* ({y}){link}"
-
-
-def _stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
-
-def fmt_block(title: str, lines: List[str]) -> str:
-    if not lines:
-        body = "لا توجد عناصر لعرضها الآن."
-    else:
-        body = "\n\n".join(lines)
-    return f"*{title}*\nآخر تحديث: `{_stamp()}`\n\n{body}"
-
-
-def menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 أفلام رائجة", callback_data="L:trend_movies"),
-         InlineKeyboardButton("📺 مسلسلات رائجة", callback_data="L:trend_shows")],
-        [InlineKeyboardButton("🔥 Top الأسبوع (أفلام)", callback_data="L:week_movies"),
-         InlineKeyboardButton("🔥 Top الأسبوع (مسلسلات)", callback_data="L:week_shows")],
-        [InlineKeyboardButton("🔧 حالة الخدمات", callback_data="L:status")],
-    ])
-
-async def safe_edit(q, text: str, **kw):
+def is_denied_host(url: str) -> bool:
     try:
-        await q.edit_message_text(text, **kw)
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            # أرسل رسالة جديدة بدل التحرير
-            await q.message.reply_text(text, **kw)
-        else:
-            raise
+        host = urlparse(url).hostname or ""
+        host = host.lower()
+        return any(s in host for s in DENY_HOST_SUBSTR)
+    except Exception:
+        return True
 
-# ===================== Handlers =====================
+async def head_for_meta(url: str):
+    r = await http().head(url, follow_redirects=True)
+    # بعض السيرفرات لا تدعم HEAD جيدًا؛ نجرب GET بدون تحميل الجسم
+    if r.status_code >= 400:
+        r = await http().get(url, follow_redirects=True, headers={"Range": "bytes=0-0"})
+    cl = int(r.headers.get("Content-Length") or r.headers.get("content-length") or 0)
+    ct = r.headers.get("Content-Type") or r.headers.get("content-type") or ""
+    disp = r.headers.get("Content-Disposition") or r.headers.get("content-disposition") or ""
+    return cl, ct, disp
+
+def guess_filename(url: str, content_disposition: str) -> str:
+    # من Content-Disposition
+    m = re.search(r'filename\*=UTF-8''([^;\n]+)', content_disposition)
+    if m:
+        return m.group(1)
+    m = re.search(r'filename="?([^";]+)"?', content_disposition)
+    if m:
+        return m.group(1)
+    # من مسار الرابط
+    name = pathlib.Path(urlparse(url).path).name
+    if name:
+        return name
+    return "file"
+
+# ===== Handlers =====
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        "👋 أهلاً! اختر قائمة مما يلي:", reply_markup=menu())
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("pong ✅")
-
-async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        items = await trending_movies(10)
-        lines = [_fmt_movie(m, i+1) for i, m in enumerate(items)]
-        await update.effective_chat.send_message(fmt_block("أفلام رائجة الآن", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-    except Exception:
-        await update.effective_chat.send_message("تعذّر جلب القائمة حالياً.")
-
-async def cmd_shows(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        items = await trending_shows(10)
-        lines = [_fmt_show(s, i+1) for i, s in enumerate(items)]
-        await update.effective_chat.send_message(fmt_block("مسلسلات رائجة الآن", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-    except Exception:
-        await update.effective_chat.send_message("تعذّر جلب القائمة حالياً.")
-
-async def cmd_topweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        mv = await watched_weekly_movies(5)
-        sh = await watched_weekly_shows(5)
-        lines = [_fmt_movie(m, i+1) for i, m in enumerate(mv)] + [""] + [_fmt_show(s, i+1) for i, s in enumerate(sh)]
-        await update.effective_chat.send_message(fmt_block("الأكثر مشاهدة هذا الأسبوع", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-    except Exception:
-        await update.effective_chat.send_message("تعذّر جلب القائمة حالياً.")
+    txt = (
+        "👋 أهلاً!\n"
+        "أرسل أمر: `/download <الرابط>` لتنزيل ملف وسائط *مسموح* (من رابط مباشر فقط).\n"
+        "هذا البوت لا ينزل من يوتيوب/تيك توك/انستقرام/سناب وغيرها.")
+    await update.effective_chat.send_message(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msgs = []
-    # Trakt
-    try:
-        _ = await trending_movies(1)
-        msgs.append("• Trakt: ✅")
-    except Exception as e:
-        msgs.append("• Trakt: ❌")
-    # OMDb
-    if OMDB_API_KEY:
-        try:
-            js = await get_json("https://www.omdbapi.com/", params={"apikey": OMDB_API_KEY, "s": "inception"})
-            ok = bool(js and js.get("Response") == "True")
-            msgs.append(f"• OMDb: {'✅' if ok else '⚠️'}")
-        except Exception:
-            msgs.append("• OMDb: ❌")
-    # Watchmode
-    if WATCHMODE_API_KEY:
-        try:
-            _ = await watchmode_sources()
-            msgs.append("• Watchmode: ✅")
-        except Exception:
-            msgs.append("• Watchmode: ❌")
-    if REGION:
-        msgs.append(f"• REGION: `{REGION}`")
-    await update.effective_chat.send_message("\n".join(msgs), parse_mode=ParseMode.MARKDOWN)
+    ok = "✅"; no = "❌"
+    await update.effective_chat.send_message(
+        f"• BOT_TOKEN: {ok}\n"
+        f"• MAX_BYTES: `{MAX_BYTES}`\n"
+        f"• القيود: منع المنصّات المحمية مفعّل",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    code = q.data
+async def cmd_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # اجلب الرابط
+    args = context.args or []
+    if not args:
+        await update.effective_chat.send_message("استخدم: `/download https://example.com/video.mp4`", parse_mode=ParseMode.MARKDOWN)
+        return
+    url = args[0].strip()
+    # تحقق من الصيغة
+    parsed = urlparse(url)
+    if parsed.scheme not in ALLOWED_SCHEMES or not parsed.netloc:
+        await update.effective_chat.send_message("رابط غير صالح.")
+        return
+    # منع المنصّات المحمية
+    if is_denied_host(url):
+        await update.effective_chat.send_message("هذا الرابط من منصة محمية—لا يمكن تنزيله هنا. أرسل رابطًا مباشرًا مسموحًا.")
+        return
+
+    # قراءة الميتاداتا
     try:
-        if code == "L:trend_movies":
-            items = await trending_movies(10)
-            lines = [_fmt_movie(m, i+1) for i, m in enumerate(items)]
-            await safe_edit(q, fmt_block("أفلام رائجة الآن", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-        elif code == "L:trend_shows":
-            items = await trending_shows(10)
-            lines = [_fmt_show(s, i+1) for i, s in enumerate(items)]
-            await safe_edit(q, fmt_block("مسلسلات رائجة الآن", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-        elif code == "L:week_movies":
-            items = await watched_weekly_movies(10)
-            lines = [_fmt_movie(m, i+1) for i, m in enumerate(items)]
-            await safe_edit(q, fmt_block("الأكثر مشاهدة هذا الأسبوع (أفلام)", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-        elif code == "L:week_shows":
-            items = await watched_weekly_shows(10)
-            lines = [_fmt_show(s, i+1) for i, s in enumerate(items)]
-            await safe_edit(q, fmt_block("الأكثر مشاهدة هذا الأسبوع (مسلسلات)", lines), parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
-        elif code == "L:status":
-            # أعد استخدام منطق /status
-            await cmd_status(update, context)
-    except httpx.HTTPStatusError:
-        await safe_edit(q, "تعذّر جلب القائمة من المزود الآن.", reply_markup=menu())
+        size, ctype, disp = await head_for_meta(url)
     except Exception:
-        await safe_edit(q, "حدث خطأ غير متوقع.", reply_markup=menu())
+        await update.effective_chat.send_message("تعذّر الوصول للرابط.")
+        return
 
-# ===================== التطبيق =====================
-async def post_init(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "ابدأ"),
-        BotCommand("movies", "أفلام رائجة"),
-        BotCommand("shows", "مسلسلات رائجة"),
-        BotCommand("topweek", "Top الأسبوع"),
-        BotCommand("status", "حالة الخدمات"),
-        BotCommand("ping", "اختبار"),
-    ])
+    # القبول: محتوى فيديو/صوت أو امتداد معروف
+    ext = pathlib.Path(urlparse(url).path).suffix.lower()
+    ok_mime = (ctype.startswith("video/") or ctype.startswith("audio/"))
+    ok_ext = ext in {".mp4", ".mov", ".mkv", ".webm", ".m4a", ".mp3", ".aac"}
+    if not (ok_mime or ok_ext):
+        await update.effective_chat.send_message("الرابط لا يبدو كملف وسائط مباشر.")
+        return
 
-def build() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("movies", cmd_movies))
-    app.add_handler(CommandHandler("shows", cmd_shows))
-    app.add_handler(CommandHandler("topweek", cmd_topweek))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CallbackQueryHandler(on_buttons, pattern=r"^L:"))
-    # أي نص → افتح القائمة
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_start))
-    return app
+    # حجم آمن
+    if size and size > MAX_BYTES:
+        await update.effective_chat.send_message("الملف كبير جدًا بالنسبة للإرسال هنا.")
+        return
 
+    file_name = guess_filename(url, disp)
+    if not pathlib.Path(file_name).suffix:
+        # حاول تخمين الامتداد من المايم تايب
+        ext2 = mimetypes.guess_extension(ctype) or ext or ".bin"
+        file_name += ext2
+
+    await update.effective_chat.send_message("جاري التنزيل… قد يستغرق بعض الوقت حسب الحجم.")
+
+    # تنزيل إلى ملف مؤقت ثم الإرسال
+    try:
+        async with http().stream("GET", url, follow_redirects=True) as r:
+            r.raise_for_status()
+            with tempfile.NamedTemporaryFile(prefix="dl_", delete=False) as f:
+                total = 0
+                async for chunk in r.aiter_bytes(64 * 1024):
+                    f.write(chunk)
+                    total += len(chunk)
+                    if total > MAX_BYTES:
+                        raise RuntimeError("file too large")
+                temp_path = f.name
+        # أرسل
+        await update.effective_chat.send_document(document=open(temp_path, "rb"), filename=file_name, caption=f"تم التحميل ✅\n{file_name}")
+    except RuntimeError:
+        await update.effective_chat.send_message("الحجم تعدّى الحد المسموح.")
+    except httpx.HTTPError:
+        await update.effective_chat.send_message("فشل التحميل من المصدر.")
+    except Exception:
+        await update.effective_chat.send_message("حدث خطأ غير متوقع أثناء التحميل.")
+    finally:
+        # نظّف الملف المؤقت
+        try:
+            if 'temp_path' in locals():
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+# أي نص غير الأوامر → مساعدة قصيرة
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+# ===== تطبيق =====
 if __name__ == "__main__":
-    log.info("[bot] starting — professional lists bot")
-    build().run_polling(drop_pending_updates=True)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("download", cmd_download))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.run_polling(drop_pending_updates=True)
